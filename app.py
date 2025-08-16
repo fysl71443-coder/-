@@ -1,82 +1,137 @@
+# =========================
+# START OF APP.PY (Top)
+# =========================
+
+# 1️⃣ Eventlet monkey patch must be first
+import eventlet
+eventlet.monkey_patch()
+
+# 2️⃣ Standard libraries
 import os
+import sys
 import logging
+import json
 from datetime import datetime, timedelta
-from flask import Flask, render_template, redirect, url_for, flash, request, jsonify
+
+# 3️⃣ Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
+# 4️⃣ Flask & extensions
+from flask import Flask, render_template, redirect, url_for, flash, request, jsonify, send_file
 from extensions import db
+
 from flask_migrate import Migrate
 from flask_login import LoginManager, login_user, login_required, logout_user, current_user
 from flask_bcrypt import Bcrypt
 from flask_babel import Babel, gettext as _
 from flask_socketio import SocketIO
 from flask_wtf.csrf import CSRFProtect, CSRFError
-from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-load_dotenv()
-
+# =========================
+# Flask App Configuration
+# =========================
 app = Flask(__name__)
+
+# Secret key
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key')
+
+# Instance folder for SQLite (fallback)
 basedir = os.path.abspath(os.path.dirname(__file__))
 instance_dir = os.path.join(basedir, 'instance')
 os.makedirs(instance_dir, exist_ok=True)
+
+# Default DB: SQLite
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(instance_dir, 'accounting_app.db')}"
 
-# Production DB (Render) support — override sqlite if DATABASE_URL provided
+# Override with production DB if available
 _db_url = os.getenv('DATABASE_URL')
 if _db_url:
+    if _db_url.startswith('postgres://'):
+        _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 # Babel / i18n
 app.config['BABEL_DEFAULT_LOCALE'] = os.getenv('BABEL_DEFAULT_LOCALE', 'en')
-babel = Babel()
-# CSRF protection for forms and APIs (for APIs, use JSON + header in future)
-# Trust proxy headers (Render)
-from werkzeug.middleware.proxy_fix import ProxyFix
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+babel = Babel(app)
 
-# Secure cookies config
-app.config.update(
-    REMEMBER_COOKIE_SECURE=True,
-    REMEMBER_COOKIE_HTTPONLY=True,
-    PREFERRED_URL_SCHEME='https'
-)
-
+# CSRF protection
 csrf = CSRFProtect(app)
 
+# Proxy fix (Render)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
-
-# --- Security hardening (cookies, headers, CORS) ---
-app.config.update(
-    SESSION_COOKIE_SECURE=True,
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE='Lax',
-)
-
-# tighten SocketIO CORS in production (Render sets RENDER to true)
-allowed_origins = os.getenv('ALLOWED_ORIGINS') or os.getenv('RENDER_EXTERNAL_URL') or '*'
-socketio = SocketIO(app, cors_allowed_origins=allowed_origins)
-
-# security headers
-@app.after_request
-def set_security_headers(resp):
-    resp.headers['X-Frame-Options'] = 'DENY'
-    resp.headers['X-Content-Type-Options'] = 'nosniff'
-    resp.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
-    resp.headers['Referrer-Policy'] = 'no-referrer-when-downgrade'
-    # basic CSP allowing self; adjust as needed for CDNs
-    resp.headers['Content-Security-Policy'] = "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://fonts.googleapis.com; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com"
-    return resp
-
-# Create instance directory if it doesn't exist
-os.makedirs('instance', exist_ok=True)
-from flask import session
-
-
+# Initialize other extensions
 db.init_app(app)
 migrate = Migrate(app, db)
-bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
+bcrypt = Bcrypt(app)
+socketio = SocketIO(app)
+
+# Production-safe runtime schema patcher (avoid heavy migrations on legacy DB)
+try:
+    if os.getenv('RENDER') == 'true' or os.getenv('RENDER'):
+        with app.app_context():
+            from sqlalchemy import inspect as _sa_inspect, text as _sa_text
+            _insp = _sa_inspect(db.engine)
+            with db.engine.begin() as _conn:
+                # 1) Ensure menu_categories table exists (idempotent)
+                if 'menu_categories' not in _insp.get_table_names():
+                    _conn.execute(_sa_text(
+                        """
+                        CREATE TABLE IF NOT EXISTS menu_categories (
+                            id SERIAL PRIMARY KEY,
+                            name VARCHAR(200) UNIQUE NOT NULL,
+                            active BOOLEAN DEFAULT TRUE,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    ))
+                # 2) Ensure Settings receipt columns and logo_url exist (idempotent)
+                if 'settings' in _insp.get_table_names():
+                    existing_cols = {c['name'] for c in _insp.get_columns('settings')}
+                    def addcol(col_sql):
+                        _conn.execute(_sa_text(col_sql))
+                    if 'receipt_paper_width' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_paper_width VARCHAR(4)")
+                    if 'receipt_margin_top_mm' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_margin_top_mm INTEGER")
+                    if 'receipt_margin_bottom_mm' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_margin_bottom_mm INTEGER")
+                    if 'receipt_margin_left_mm' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_margin_left_mm INTEGER")
+                    if 'receipt_margin_right_mm' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_margin_right_mm INTEGER")
+                    if 'receipt_font_size' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_font_size INTEGER")
+                    if 'receipt_show_logo' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_show_logo BOOLEAN DEFAULT TRUE")
+                    if 'receipt_show_tax_number' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_show_tax_number BOOLEAN DEFAULT TRUE")
+                    if 'receipt_footer_text' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS receipt_footer_text VARCHAR(300)")
+                    if 'logo_url' not in existing_cols:
+                        addcol("ALTER TABLE settings ADD COLUMN IF NOT EXISTS logo_url VARCHAR(300)")
+except Exception as _patch_err:
+    logging.error('Runtime schema patch failed: %s', _patch_err, exc_info=True)
+
+# =========================
+# END OF INITIALIZATION
+# =========================
+
+# Routes and rest of app.py remain unchanged
+
+# Ensure SQLAlchemy track modifications disabled
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Babel / i18n
+app.config['BABEL_DEFAULT_LOCALE'] = os.getenv('BABEL_DEFAULT_LOCALE', 'en')
+
+from flask import session
+
 login_manager.login_view = 'login'
 
 # Basic error logging to file (errors only)
@@ -94,12 +149,11 @@ def save_to_db(instance):
         return False
 
 
+
 # Rate limiting for login attempts
 login_attempts = {}  # { ip_address: {"count": int, "last_attempt": datetime} }
 
 # Import models after db created
-import models
-models.db = db
 from models import User, Invoice, SalesInvoice, SalesInvoiceItem, Product, RawMaterial, Meal, MealIngredient, PurchaseInvoice, PurchaseInvoiceItem, ExpenseInvoice, ExpenseInvoiceItem, Employee, Salary, Payment, Account, LedgerEntry
 
 @login_manager.user_loader
@@ -117,16 +171,6 @@ def get_locale():
     except Exception:
         pass
     return request.accept_languages.best_match(['ar', 'en']) or 'ar'
-
-# Health check endpoint for Render
-@app.route('/healthz')
-def healthz():
-    return jsonify(status='ok'), 200
-
-# Disable Flask debug by default when running under Gunicorn/Render
-if os.getenv('RENDER') or os.getenv('GUNICORN_CMD_ARGS'):
-    app.config['DEBUG'] = False
-
 @app.context_processor
 def inject_settings():
     try:
@@ -135,12 +179,6 @@ def inject_settings():
         return dict(settings=s)
     except Exception:
         return dict(settings=None)
-
-# Make CSRF token generator available in templates for forms and JS
-@app.context_processor
-def inject_csrf_token():
-    from flask_wtf.csrf import generate_csrf
-    return dict(csrf_token=generate_csrf)
 
 @app.route('/toggle_theme', methods=['POST'])
 @login_required
@@ -227,10 +265,170 @@ def logout():
     flash(_('تم تسجيل الخروج / Logged out.'), 'info')
     return redirect(url_for('login'))
 
-# Dashboard routes
-@app.route('/sales', methods=['GET', 'POST'])
+@app.route('/pos/<branch_code>')
+@login_required
+def pos_home(branch_code):
+    # Minimal POS home to avoid template errors; integrate with real POS later
+    if branch_code not in ('place_india','china_town'):
+        flash(_('Unknown branch / فرع غير معروف'), 'danger')
+        return redirect(url_for('dashboard'))
+    return render_template('pos_home.html', branch_code=branch_code)
+
+@app.route('/sales/<branch_code>', methods=['GET', 'POST'])
+@login_required
+def sales_branch(branch_code):
+    # Validate branch
+    if not is_valid_branch(branch_code):
+        flash(_('Unknown branch / فرع غير معروف'), 'danger')
+        return redirect(url_for('dashboard'))
+
+    # Permissions: show page and create
+    if request.method == 'POST' and not can_perm('sales','add', branch_scope=branch_code):
+        flash(_('You do not have permission / لا تملك صلاحية الوصول'), 'danger')
+        return redirect(url_for('sales_branch', branch_code=branch_code))
+    if request.method == 'GET' and not can_perm('sales','view', branch_scope=branch_code):
+        flash(_('You do not have permission / لا تملك صلاحية الوصول'), 'danger')
+        return redirect(url_for('dashboard'))
+
+    # Prepare meals
+    meals = Meal.query.filter_by(active=True).all()
+    product_choices = [(0, _('Select Meal / اختر الوجبة'))] + [(m.id, m.display_name) for m in meals]
+
+    form = SalesInvoiceForm()
+    # Force branch field to the fixed branch to satisfy validators and choices
+    form.branch.data = branch_code
+    for item_form in form.items:
+        item_form.product_id.choices = product_choices
+
+    # Prepare meals JSON for front-end helpers
+    products_json = json.dumps([{
+        'id': m.id,
+        'name': m.display_name,
+        'price_before_tax': float(m.selling_price)
+    } for m in meals])
+
+    # Default date
+    if request.method == 'GET':
+        form.date.data = datetime.utcnow().date()
+
+    # Handle submit
+    if form.validate_on_submit():
+        # Generate invoice number
+        last_invoice = SalesInvoice.query.filter_by(branch=branch_code).order_by(SalesInvoice.id.desc()).first()
+        if last_invoice and last_invoice.invoice_number and '-' in last_invoice.invoice_number:
+            try:
+                last_num = int(last_invoice.invoice_number.split('-')[-1])
+                invoice_number = f'SAL-{datetime.utcnow().year}-{last_num + 1:03d}'
+            except Exception:
+                invoice_number = f'SAL-{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
+        else:
+            invoice_number = f'SAL-{datetime.utcnow().year}-001'
+
+        # Totals
+        total_before_tax = 0.0
+        total_tax = 0.0
+        total_discount = 0.0
+        tax_rate = 0.15
+
+        invoice = SalesInvoice(
+            invoice_number=invoice_number,
+            date=form.date.data,
+            payment_method=form.payment_method.data,
+            branch=branch_code,
+            customer_name=form.customer_name.data,
+            customer_phone=form.customer_phone.data,
+            total_before_tax=0,
+            tax_amount=0,
+            discount_amount=0,
+            total_after_tax_discount=0,
+            status='unpaid',
+            user_id=current_user.id
+        )
+        db.session.add(invoice)
+        db.session.flush()
+
+        for item_form in form.items.entries:
+            if item_form.product_id.data and item_form.product_id.data != 0:
+                meal = Meal.query.get(item_form.product_id.data)
+                if meal:
+                    qty = float(item_form.quantity.data)
+                    discount_pct = float(item_form.discount.data or 0)
+                    unit_price = float(meal.selling_price)
+                    price_before_tax = unit_price * qty
+                    tax = price_before_tax * tax_rate
+                    discount_value = (price_before_tax + tax) * (discount_pct/100.0)
+                    total_item = price_before_tax + tax - discount_value
+
+                    total_before_tax += price_before_tax
+                    total_tax += tax
+                    total_discount += discount_value
+
+                    inv_item = SalesInvoiceItem(
+                        invoice_id=invoice.id,
+                        product_name=meal.display_name,
+                        quantity=qty,
+                        price_before_tax=meal.selling_price,
+                        tax=tax,
+                        discount=discount_value,
+                        total_price=total_item
+                    )
+                    db.session.add(inv_item)
+
+        total_after_tax_discount = total_before_tax + total_tax - total_discount
+        invoice.total_before_tax = total_before_tax
+        invoice.tax_amount = total_tax
+        invoice.discount_amount = total_discount
+        invoice.total_after_tax_discount = total_after_tax_discount
+        db.session.commit()
+
+        # Emit and redirect on success
+        socketio.emit('sales_update', {
+            'invoice_number': invoice_number,
+            'branch': branch_code,
+            'total': float(total_after_tax_discount)
+        })
+        flash(_('Invoice created successfully / تم إنشاء الفاتورة بنجاح'), 'success')
+        return redirect(url_for('sales_branch', branch_code=branch_code))
+
+    # If POST but validation failed, show errors to help diagnose and stay on page
+    if request.method == 'POST' and not form.validate():
+        # Friendly message for common case: items invalid/missing
+        if 'items' in (form.errors or {}):
+            flash(_('Please complete invoice items (select meal and set quantity) / يرجى إكمال عناصر الفاتورة (اختر وجبة وحدد الكمية)'), 'danger')
+        # Fallback: show top-level field errors
+        try:
+            for fname, errs in (form.errors or {}).items():
+                # Skip items detailed dump to avoid noise
+                if fname == 'items':
+                    continue
+                if not errs:
+                    continue
+                label = getattr(getattr(form, fname, None), 'label', None)
+                label_text = label.text if label else fname
+                flash(f"{label_text}: {', '.join([str(e) for e in errs])}", 'danger')
+        except Exception:
+            pass
+
+    # List invoices for this branch only
+    invoices = SalesInvoice.query.filter_by(branch=branch_code).order_by(SalesInvoice.date.desc()).all()
+    return render_template('sales.html', form=form, invoices=invoices, products_json=products_json, fixed_branch=branch_code, branch_label=branch_label)
+
+    return redirect(url_for('login'))
+
+# Sales entry: Branch cards -> Tables -> Table invoice
+@app.route('/sales', methods=['GET'])
 @login_required
 def sales():
+    branches = [
+        {'code': 'china_town', 'label': 'China Town', 'url': url_for('sales_tables', branch_code='china_town')},
+        {'code': 'place_india', 'label': 'Place India', 'url': url_for('sales_tables', branch_code='place_india')},
+    ]
+    return render_template('sales_branches.html', branches=branches)
+
+# Old unified sales screen kept under /sales/all for backward links
+@app.route('/sales/all', methods=['GET', 'POST'])
+@login_required
+def sales_all():
     import json
     # Permissions: POST requires 'add'
     if request.method == 'POST' and not can_perm('sales','add'):
@@ -257,118 +455,286 @@ def sales():
     if form.validate_on_submit():
         # Generate invoice number
         last_invoice = SalesInvoice.query.order_by(SalesInvoice.id.desc()).first()
-        if last_invoice:
-            last_num = int(last_invoice.invoice_number.split('-')[-1])
-            invoice_number = f'SAL-2024-{last_num + 1:03d}'
+        if last_invoice and last_invoice.invoice_number and '-' in last_invoice.invoice_number:
+            try:
+                last_num = int(last_invoice.invoice_number.split('-')[-1])
+                invoice_number = f'SAL-{datetime.utcnow().year}-{last_num + 1:03d}'
+            except Exception:
+                invoice_number = f'SAL-{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
         else:
-            invoice_number = 'SAL-2024-001'
+            invoice_number = f'SAL-{datetime.utcnow().year}-001'
 
-        # Calculate totals
-        total_before_tax = 0
-        total_tax = 0
-        total_discount = 0
-        tax_rate = 0.15
-
-        # Create invoice
-        invoice = SalesInvoice(
-            invoice_number=invoice_number,
-            date=form.date.data,
-            payment_method=form.payment_method.data,
-            branch=form.branch.data,
-            customer_name=form.customer_name.data,
-            total_before_tax=0,  # Will be calculated
-            tax_amount=0,  # Will be calculated
-            discount_amount=0,  # Will be calculated
-            total_after_tax_discount=0,  # Will be calculated
-            status='unpaid',
-            user_id=current_user.id
-        )
-        db.session.add(invoice)
-        db.session.flush()
-
-        # Add invoice items and calculate totals
-        for item_form in form.items.entries:
-            if item_form.product_id.data and item_form.product_id.data != 0:  # Valid meal selected
-                meal = Meal.query.get(item_form.product_id.data)
-                if meal:
-                    qty = item_form.quantity.data
-                    discount = float(item_form.discount.data or 0)
-
-                    # Calculate amounts using meal's selling price
-                    price_before_tax = float(meal.selling_price) * qty
-                    tax = price_before_tax * tax_rate
-                    total_item = price_before_tax + tax - discount
-
-                    # Add to invoice totals
-                    total_before_tax += price_before_tax
-                    total_tax += tax
-                    total_discount += discount
-
-                    # Create invoice item
-                    inv_item = SalesInvoiceItem(
-                        invoice_id=invoice.id,
-                        product_name=meal.display_name,
-                        quantity=qty,
-                        price_before_tax=meal.selling_price,
-                        tax=tax,
-                        discount=discount,
-                        total_price=total_item
-                    )
-                    db.session.add(inv_item)
-
-        # Update invoice totals
-        total_after_tax_discount = total_before_tax + total_tax - total_discount
-        invoice.total_before_tax = total_before_tax
-        invoice.tax_amount = total_tax
-        invoice.discount_amount = total_discount
-        invoice.total_after_tax_discount = total_after_tax_discount
-
-        db.session.commit()
-        # Post to ledger (Revenue, VAT Output, Cash/AR)
-        try:
-            # Ensure core accounts exist
-            def get_or_create(code, name, type_):
-                acc = Account.query.filter_by(code=code).first()
-                if not acc:
-                    acc = Account(code=code, name=name, type=type_)
-                    db.session.add(acc); db.session.flush()
-                return acc
-            rev_acc = get_or_create('4000', 'Sales Revenue', 'REVENUE')
-            vat_out_acc = get_or_create('2100', 'VAT Output', 'LIABILITY')
-            cash_acc = get_or_create('1000', 'Cash', 'ASSET')
-            ar_acc = get_or_create('1100', 'Accounts Receivable', 'ASSET')
-
-            # Determine settlement account based on payment method
-            settle_acc = cash_acc if invoice.payment_method in ['cash','mada','visa','bank'] else ar_acc
-            # Revenue entry
-            db.session.add(LedgerEntry(date=invoice.date, account_id=rev_acc.id, credit=invoice.total_before_tax, debit=0, description=f'Sales {invoice.invoice_number}'))
-            # VAT output
-            db.session.add(LedgerEntry(date=invoice.date, account_id=vat_out_acc.id, credit=invoice.tax_amount, debit=0, description=f'VAT Output {invoice.invoice_number}'))
-            # Settlement (debit)
-            db.session.add(LedgerEntry(date=invoice.date, account_id=settle_acc.id, debit=invoice.total_after_tax_discount, credit=0, description=f'Settlement {invoice.invoice_number}'))
+# Seed default menu categories once (safe, best-effort)
+MENU_SEEDED = False
+@app.before_request
+def _seed_menu_categories_once():
+    global MENU_SEEDED
+    if MENU_SEEDED:
+        return
+    try:
+        from models import MenuCategory
+        defaults = [
+            'Appetizers','Soups','Salads','House Special','Prawns','Seafoods','Chinese Sizzling','Shaw Faw',
+            'Chicken','Beef & Lamb','Rice & Biryani','Noodles & Chopsuey','Charcoal Grill / Kebabs',
+            'Indian Delicacy (Chicken)','Indian Delicacy (Fish)','Indian Delicacy (Vegetables)','Juices','Soft Drink'
+        ]
+        existing = {c.name for c in MenuCategory.query.all()}
+        to_add = [name for name in defaults if name not in existing]
+        if to_add:
+            for name in to_add:
+                db.session.add(MenuCategory(name=name))
             db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            logging.error('Ledger posting (sales) failed: %s', e, exc_info=True)
+    except Exception:
+        # Table may not exist yet; ignore
+        pass
+    finally:
+        MENU_SEEDED = True
 
+# Helpers
+BRANCH_CODES = {'china_town': 'China Town', 'place_india': 'Place India'}
+PAYMENT_METHODS = ['CASH','MADA','VISA','MASTERCARD','BANK','AKS','GCC']
 
-        # Emit real-time update
-        socketio.emit('sales_update', {
-            'invoice_number': invoice_number,
-            'branch': form.branch.data,
-            'total': float(total_after_tax_discount)
-        }, broadcast=True)
+def is_valid_branch(code: str) -> bool:
+    return code in BRANCH_CODES
 
-        flash(_('Invoice created successfully / تم إنشاء الفاتورة بنجاح'), 'success')
+# Tables screen: 1..50 per branch
+@app.route('/sales/<branch_code>/tables', methods=['GET'])
+@login_required
+def sales_tables(branch_code):
+    if not is_valid_branch(branch_code):
+        flash(_('Unknown branch / فرع غير معروف'), 'danger')
         return redirect(url_for('sales'))
+    tables = list(range(1, 51))
+    return render_template('sales_tables.html', branch_code=branch_code, branch_label=BRANCH_CODES[branch_code], tables=tables)
 
-    # Set default date for new form
-    if request.method == 'GET':
-        form.date.data = datetime.utcnow().date()
+# Table invoice screen (split UI)
+@app.route('/sales/<branch_code>/table/<int:table_no>', methods=['GET'])
+@login_required
+def sales_table_invoice(branch_code, table_no):
+    if not is_valid_branch(branch_code) or table_no < 1 or table_no > 50:
+        flash(_('Unknown branch/table / فرع أو طاولة غير معروف'), 'danger')
+        return redirect(url_for('sales'))
+    import json
+    # Load meals and categories (prefer MenuCategory if defined)
+    try:
+        meals = Meal.query.filter_by(active=True).all()
+    except Exception as e:
+        logging.error('Meals query failed: %s', e, exc_info=True)
+        meals = []
+    try:
+        from models import MenuCategory
+        active_cats = [c.name for c in MenuCategory.query.filter_by(active=True).order_by(MenuCategory.name.asc()).all()]
+        categories = active_cats if active_cats else sorted({(m.category or _('Uncategorized')) for m in meals})
+    except Exception:
+        categories = sorted({(m.category or _('Uncategorized')) for m in meals})
+    meals_data = [{
+        'id': m.id,
+        'name': m.display_name,
+        'category': m.category or _('Uncategorized'),
+        'price': float(m.selling_price or 0)
+    } for m in meals]
+    # VAT rate from settings if available
+    from models import Settings
+    settings = Settings.query.first()
+    vat_rate = float(settings.vat_rate) if settings and settings.vat_rate is not None else 15.0
+    from datetime import date as _date
+    return render_template('sales_table_invoice.html',
+                           branch_code=branch_code,
+                           branch_label=BRANCH_CODES[branch_code],
+                           table_no=table_no,
+                           categories=categories,
+                           meals_json=json.dumps(meals_data),
+                           vat_rate=vat_rate,
+                           today=_date.today().isoformat())
 
-    # Get all sales invoices
-    invoices = SalesInvoice.query.order_by(SalesInvoice.date.desc()).all()
-    return render_template('sales.html', form=form, invoices=invoices, products_json=products_json)
+# API: customer lookup by name or phone
+@app.route('/api/customers/lookup')
+@login_required
+def api_customer_lookup():
+    q = (request.args.get('q') or '').strip()
+    if not q:
+        return jsonify([])
+    try:
+        from models import Customer
+        res = Customer.query.filter(
+            (Customer.name.ilike(f"%{q}%")) | (Customer.phone.ilike(f"%{q}%"))
+        ).order_by(Customer.name.asc()).limit(10).all()
+        return jsonify([{'id': c.id, 'name': c.name, 'phone': c.phone, 'discount_percent': float(c.discount_percent or 0)} for c in res])
+    except Exception:
+        # If table doesn't exist yet, return empty
+        return jsonify([])
+
+
+# Checkout API: create invoice + items + payment, then return receipt URL
+@app.route('/api/sales/checkout', methods=['POST'])
+@login_required
+def api_sales_checkout():
+    from datetime import datetime as _dt
+    data = request.get_json(silent=True) or {}
+    branch_code = data.get('branch_code')
+    table_no = int(data.get('table_no') or 0)
+    items = data.get('items') or []  # [{meal_id, qty}]
+    customer_name = data.get('customer_name') or None
+    customer_phone = data.get('customer_phone') or None  # Stored in description for now
+    discount_pct = float(data.get('discount_pct') or 0)
+    tax_pct = float(data.get('tax_pct') or 15)
+    payment_method = data.get('payment_method') or 'CASH'
+    if not is_valid_branch(branch_code) or not items:
+        return jsonify({'ok': False, 'error': 'Invalid branch or empty items'}), 400
+
+    # Generate invoice number SAL-YYYY-###
+    last = SalesInvoice.query.order_by(SalesInvoice.id.desc()).first()
+    if last and last.invoice_number and '-' in last.invoice_number:
+        try:
+            last_num = int(str(last.invoice_number).split('-')[-1])
+            new_num = last_num + 1
+        except Exception:
+            new_num = 1
+    else:
+        new_num = 1
+    invoice_number = f"SAL-{_dt.utcnow().year}-{new_num:03d}"
+
+    # Calculate totals and build items
+    subtotal = 0.0
+    tax_total = 0.0
+    invoice_items = []
+    from sqlalchemy import or_
+    from models import MenuSection, MenuSectionItem
+    for it in items:
+        meal = Meal.query.get(int(it.get('meal_id')))
+        qty = float(it.get('qty') or 0)
+        if not meal or qty <= 0:
+            continue
+        # Determine effective unit price: prefer MenuSectionItem.price_override for this branch (or global)
+        unit = None
+        try:
+            msi = (MenuSectionItem.query
+                   .join(MenuSection, MenuSectionItem.section_id == MenuSection.id)
+                   .filter(MenuSectionItem.meal_id == meal.id,
+                           or_(MenuSection.branch == branch_code, MenuSection.branch == None))  # noqa: E711
+                   .order_by(MenuSectionItem.display_order.asc())
+                   .first())
+            if msi and msi.price_override is not None:
+                unit = float(msi.price_override)
+        except Exception:
+            pass
+        if unit is None:
+            unit = float(meal.selling_price or 0)
+        line_sub = unit * qty
+        line_tax = line_sub * (tax_pct/100.0)
+        subtotal += line_sub
+        tax_total += line_tax
+        total_line = line_sub + line_tax
+        invoice_items.append({
+            'name': meal.display_name,
+            'qty': qty,
+            'price_before_tax': unit,
+            'tax': line_tax,
+            'total': total_line
+        })
+
+    discount_val = (subtotal + tax_total) * (discount_pct/100.0)
+    grand_total = (subtotal + tax_total) - discount_val
+
+    # Persist invoice
+    inv = SalesInvoice(
+        invoice_number=invoice_number,
+        date=_dt.utcnow().date(),
+        payment_method=payment_method,
+        branch=branch_code,
+        customer_name=customer_name,
+        customer_phone=customer_phone,
+        total_before_tax=subtotal,
+        tax_amount=tax_total,
+        discount_amount=discount_val,
+        total_after_tax_discount=grand_total,
+        status='paid',
+        user_id=current_user.id
+    )
+    db.session.add(inv)
+    db.session.flush()
+
+    for it in invoice_items:
+        db.session.add(SalesInvoiceItem(
+            invoice_id=inv.id,
+            product_name=it['name'],
+            quantity=it['qty'],
+            price_before_tax=it['price_before_tax'],
+            tax=it['tax'],
+            discount=0,
+            total_price=it['total']
+        ))
+
+    # Record payment
+    db.session.add(Payment(
+        invoice_id=inv.id,
+        invoice_type='sales',
+        amount_paid=grand_total,
+        payment_method=payment_method
+    ))
+
+    db.session.commit()
+
+    receipt_url = url_for('sales_receipt', invoice_id=inv.id)
+    return jsonify({'ok': True, 'invoice_id': inv.id, 'print_url': receipt_url})
+
+# POS API: sections (per branch) and items (per section)
+@app.route('/api/pos/<branch_code>/sections')
+@login_required
+def api_pos_sections(branch_code):
+    if not is_valid_branch(branch_code):
+        return jsonify({'error': 'invalid branch'}), 400
+    try:
+        from sqlalchemy import or_
+        from models import MenuSection
+        q = (MenuSection.query
+             .filter(or_(MenuSection.branch == branch_code, MenuSection.branch == None))  # noqa: E711
+             .order_by(MenuSection.display_order.asc(), MenuSection.name.asc()))
+        sections = [{'id': s.id, 'name': s.name, 'image_url': s.image_url} for s in q.all()]
+        return jsonify(sections)
+    except Exception as e:
+        app.logger.error('api_pos_sections failed: %s', e, exc_info=True)
+        return jsonify([])
+
+
+@app.route('/api/pos/sections/<int:section_id>/items')
+@login_required
+def api_pos_section_items(section_id):
+    try:
+        from models import MenuSection, MenuSectionItem
+        sec = MenuSection.query.get_or_404(section_id)
+        items = (MenuSectionItem.query
+                 .filter_by(section_id=section_id)
+                 .order_by(MenuSectionItem.display_order.asc())
+                 .all())
+        payload = []
+        for it in items:
+            try:
+                price = float(it.price_override) if it.price_override is not None else float(it.meal.selling_price or 0)
+            except Exception:
+                price = 0.0
+            payload.append({
+                'meal_id': it.meal_id,
+                'name': it.meal.display_name,
+                'price': price,
+                'image_url': (it.image_url if hasattr(it, 'image_url') and it.image_url else sec.image_url)
+            })
+        return jsonify({'section': {'id': sec.id, 'name': sec.name, 'image_url': sec.image_url}, 'items': payload})
+    except Exception as e:
+        app.logger.error('api_pos_section_items failed: %s', e, exc_info=True)
+        return jsonify({'section': None, 'items': []})
+
+
+# Receipt (80mm thermal style)
+@app.route('/sales/receipt/<int:invoice_id>')
+@login_required
+def sales_receipt(invoice_id):
+    invoice = SalesInvoice.query.get_or_404(invoice_id)
+    items = SalesInvoiceItem.query.filter_by(invoice_id=invoice_id).all()
+    from models import Settings
+    settings = Settings.query.first()
+    return render_template('sales_receipt.html', invoice=invoice, items=items, settings=settings)
+
 
 @app.route('/purchases', methods=['GET', 'POST'])
 @login_required
@@ -397,11 +763,14 @@ def purchases():
     if form.validate_on_submit():
         # Generate invoice number
         last_invoice = PurchaseInvoice.query.order_by(PurchaseInvoice.id.desc()).first()
-        if last_invoice:
-            last_num = int(last_invoice.invoice_number.split('-')[-1])
-            invoice_number = f'PUR-2024-{last_num + 1:03d}'
+        if last_invoice and last_invoice.invoice_number and '-' in last_invoice.invoice_number:
+            try:
+                last_num = int(last_invoice.invoice_number.split('-')[-1])
+                invoice_number = f'PUR-{datetime.utcnow().year}-{last_num + 1:03d}'
+            except Exception:
+                invoice_number = f'PUR-{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
         else:
-            invoice_number = 'PUR-2024-001'
+            invoice_number = f'PUR-{datetime.utcnow().year}-001'
 
         # Calculate totals
         total_before_tax = 0
@@ -432,11 +801,12 @@ def purchases():
                 if raw_material:
                     qty = float(item_form.quantity.data)
                     unit_price = float(item_form.price_before_tax.data)
-                    discount = float(item_form.discount.data or 0)
+                    discount_pct = float(item_form.discount.data or 0)  # percent
 
                     # Calculate amounts
                     price_before_tax = unit_price * qty
                     tax = price_before_tax * tax_rate
+                    discount = (price_before_tax + tax) * (discount_pct/100.0)
                     total_item = price_before_tax + tax - discount
 
                     # Add to invoice totals
@@ -496,7 +866,8 @@ def purchases():
             cash_acc = get_or_create('1000', 'Cash', 'ASSET')
             ap_acc = get_or_create('2000', 'Accounts Payable', 'LIABILITY')
 
-            settle_acc = cash_acc if invoice.payment_method in ['cash','mada','visa','bank'] else ap_acc
+            settle_cash_like = ['CASH','MADA','VISA','MASTERCARD','BANK','AKS','GCC','cash','mada','visa','mastercard','bank','aks','gcc']
+            settle_acc = cash_acc if (invoice.payment_method in settle_cash_like) else ap_acc
             db.session.add(LedgerEntry(date=invoice.date, account_id=inv_acc.id, debit=invoice.total_before_tax, credit=0, description=f'Purchase {invoice.invoice_number}'))
             db.session.add(LedgerEntry(date=invoice.date, account_id=vat_in_acc.id, debit=invoice.tax_amount, credit=0, description=f'VAT Input {invoice.invoice_number}'))
             db.session.add(LedgerEntry(date=invoice.date, account_id=settle_acc.id, credit=invoice.total_after_tax_discount, debit=0, description=f'Settlement {invoice.invoice_number}'))
@@ -513,7 +884,7 @@ def purchases():
             'invoice_number': invoice_number,
             'supplier': form.supplier_name.data,
             'total': float(total_after_tax_discount)
-        }, broadcast=True)
+        })
 
         flash(_('Purchase invoice created and stock updated successfully / تم إنشاء فاتورة الشراء وتحديث المخزون بنجاح'), 'success')
         return redirect(url_for('purchases'))
@@ -522,9 +893,11 @@ def purchases():
     if request.method == 'GET':
         form.date.data = datetime.utcnow().date()
 
-    # Get all purchase invoices
-    invoices = PurchaseInvoice.query.order_by(PurchaseInvoice.date.desc()).all()
-    return render_template('purchases.html', form=form, invoices=invoices, materials_json=materials_json)
+    # Pagination for purchase invoices
+    page = int(request.args.get('page') or 1)
+    per_page = min(100, int(request.args.get('per_page') or 25))
+    pag = PurchaseInvoice.query.order_by(PurchaseInvoice.date.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    return render_template('purchases.html', form=form, invoices=pag.items, pagination=pag, materials_json=materials_json)
 
 @app.route('/expenses', methods=['GET', 'POST'])
 @login_required
@@ -534,11 +907,14 @@ def expenses():
     if form.validate_on_submit():
         # Generate invoice number
         last_invoice = ExpenseInvoice.query.order_by(ExpenseInvoice.id.desc()).first()
-        if last_invoice:
-            last_num = int(last_invoice.invoice_number.split('-')[-1])
-            invoice_number = f'EXP-2024-{last_num + 1:03d}'
+        if last_invoice and last_invoice.invoice_number and '-' in last_invoice.invoice_number:
+            try:
+                last_num = int(last_invoice.invoice_number.split('-')[-1])
+                invoice_number = f'EXP-{datetime.utcnow().year}-{last_num + 1:03d}'
+            except Exception:
+                invoice_number = f'EXP-{datetime.utcnow().strftime("%Y%m%d%H%M%S")}'
         else:
-            invoice_number = 'EXP-2024-001'
+            invoice_number = f'EXP-{datetime.utcnow().year}-001'
 
         # Calculate totals
         total_before_tax = 0
@@ -562,14 +938,16 @@ def expenses():
 
         # Add invoice items
         for item_form in form.items.entries:
-            if item_form.description.data:  # Only process items with description
+            # Note: 'description' conflicts with WTForms Field.description (a string); use the nested form explicitly
+            if item_form.form.description.data:  # Only process items with description
                 qty = float(item_form.quantity.data)
                 price = float(item_form.price_before_tax.data)
                 tax = float(item_form.tax.data or 0)
-                discount = float(item_form.discount.data or 0)
+                discount_pct = float(item_form.discount.data or 0)
 
                 # Calculate amounts
                 item_before_tax = price * qty
+                discount = (item_before_tax + tax) * (discount_pct/100.0)
                 total_item = item_before_tax + tax - discount
 
                 # Add to invoice totals
@@ -580,7 +958,7 @@ def expenses():
                 # Create invoice item
                 inv_item = ExpenseInvoiceItem(
                     invoice_id=invoice.id,
-                    description=item_form.description.data,
+                    description=item_form.form.description.data,
                     quantity=qty,
                     price_before_tax=price,
                     tax=tax,
@@ -610,7 +988,8 @@ def expenses():
             cash_acc = get_or_create('1000', 'Cash', 'ASSET')
             ap_acc = get_or_create('2000', 'Accounts Payable', 'LIABILITY')
 
-            settle_acc = cash_acc if invoice.payment_method in ['cash','mada','visa','bank'] else ap_acc
+            settle_cash_like = ['CASH','MADA','VISA','MASTERCARD','BANK','AKS','GCC','cash','mada','visa','mastercard','bank','aks','gcc']
+            settle_acc = cash_acc if (invoice.payment_method in settle_cash_like) else ap_acc
             db.session.add(LedgerEntry(date=invoice.date, account_id=exp_acc.id, debit=invoice.total_before_tax, credit=0, description=f'Expense {invoice.invoice_number}'))
             db.session.add(LedgerEntry(date=invoice.date, account_id=vat_in_acc.id, debit=invoice.tax_amount, credit=0, description=f'VAT Input {invoice.invoice_number}'))
             db.session.add(LedgerEntry(date=invoice.date, account_id=settle_acc.id, debit=0, credit=invoice.total_after_tax_discount, description=f'Settlement {invoice.invoice_number}'))
@@ -624,18 +1003,29 @@ def expenses():
         socketio.emit('expense_update', {
             'invoice_number': invoice_number,
             'total': float(total_after_tax_discount)
-        }, broadcast=True)
+        })
 
         flash(_('Expense invoice created successfully / تم إنشاء فاتورة المصروفات بنجاح'), 'success')
         return redirect(url_for('expenses'))
+
+    # If POST but validation failed, show error hints
+    if request.method == 'POST' and not form.validate():
+        try:
+            for fname, errs in (form.errors or {}).items():
+                if not errs: continue
+                flash(f"{fname}: {', '.join([str(e) for e in errs])}", 'danger')
+        except Exception:
+            pass
 
     # Set default date for new form
     if request.method == 'GET':
         form.date.data = datetime.utcnow().date()
 
-    # Get all expense invoices
-    invoices = ExpenseInvoice.query.order_by(ExpenseInvoice.date.desc()).all()
-    return render_template('expenses.html', form=form, invoices=invoices)
+    # Pagination for expense invoices
+    page = int(request.args.get('page') or 1)
+    per_page = min(100, int(request.args.get('per_page') or 25))
+    pag = ExpenseInvoice.query.order_by(ExpenseInvoice.date.desc()).paginate(page=page, per_page=per_page, error_out=False)
+    return render_template('expenses.html', form=form, invoices=pag.items, pagination=pag)
 
 @app.route('/invoices')
 @login_required
@@ -730,6 +1120,9 @@ def view_invoice(kind, invoice_id):
     title = 'Invoice'
     if kind == 'sales':
         inv = SalesInvoice.query.get_or_404(invoice_id)
+        if not can_perm('sales','view', branch_scope=inv.branch):
+            flash(_('You do not have permission / لا تملك صلاحية الوصول'), 'danger')
+            return redirect(url_for('invoices'))
         items = SalesInvoiceItem.query.filter_by(invoice_id=inv.id).all()
         title = 'Sales Invoice'
     elif kind == 'purchase':
@@ -837,57 +1230,98 @@ def payments():
     status_filter = request.args.get('status')
     type_filter = request.args.get('type')
 
-    # Build unified invoices view via union_all
+    # Build unified invoices view via union_all (tolerate missing legacy tables)
     from sqlalchemy import literal, func
+    from sqlalchemy import cast, String
+    from sqlalchemy import inspect as _sa_inspect, union_all
+    _insp = _sa_inspect(db.engine)
+    _tables = set(_insp.get_table_names())
+    # Cross-database safe date expression for salary (year,month -> date)
+    try:
+        _dialect = db.engine.dialect.name
+    except Exception:
+        _dialect = 'postgresql'
+    if _dialect == 'postgresql':
+        date_expr = func.to_date(func.concat(cast(Salary.year, String), '-', func.lpad(cast(Salary.month, String), 2, '0'), '-01'), 'YYYY-MM-DD')
+    else:
+        # Fallback for non-Postgres (avoid printf which doesn't exist in PG)
+        date_expr = func.date('now')
+
+    # Introspect columns to tolerate legacy schemas
+    cols_sales = {c['name'] for c in _insp.get_columns('sales_invoices')} if 'sales_invoices' in _tables else set()
+    cols_purch = {c['name'] for c in _insp.get_columns('purchase_invoices')} if 'purchase_invoices' in _tables else set()
+    cols_exp = {c['name'] for c in _insp.get_columns('expense_invoices')} if 'expense_invoices' in _tables else set()
+
+    sales_party = SalesInvoice.customer_name if 'customer_name' in cols_sales else literal('Customer')
+    sales_total = SalesInvoice.total_after_tax_discount if 'total_after_tax_discount' in cols_sales else literal(0)
+    sales_date = SalesInvoice.date if 'date' in cols_sales else func.now()
+    sales_status = SalesInvoice.status if 'status' in cols_sales else literal('unpaid')
     sales_q = db.session.query(
         SalesInvoice.id.label('id'),
         literal('sales').label('type'),
-        SalesInvoice.customer_name.label('party'),
-        SalesInvoice.total_after_tax_discount.label('total'),
+        sales_party.label('party'),
+        sales_total.label('total'),
         literal(0).label('paid'),
-        SalesInvoice.date.label('date'),
-        SalesInvoice.status.label('status')
+        sales_date.label('date'),
+        sales_status.label('status')
     )
+
+    purch_party = PurchaseInvoice.supplier_name if 'supplier_name' in cols_purch else literal('Supplier')
+    purch_total = PurchaseInvoice.total_after_tax_discount if 'total_after_tax_discount' in cols_purch else literal(0)
+    purch_date = PurchaseInvoice.date if 'date' in cols_purch else func.now()
+    purch_status = PurchaseInvoice.status if 'status' in cols_purch else literal('unpaid')
     purchases_q = db.session.query(
         PurchaseInvoice.id,
         literal('purchase'),
-        PurchaseInvoice.supplier_name,
-        PurchaseInvoice.total_after_tax_discount,
+        purch_party,
+        purch_total,
         literal(0),
-        PurchaseInvoice.date,
-        PurchaseInvoice.status
+        purch_date,
+        purch_status
     )
+
+    exp_total = ExpenseInvoice.total_after_tax_discount if 'total_after_tax_discount' in cols_exp else literal(0)
+    exp_date = ExpenseInvoice.date if 'date' in cols_exp else func.now()
+    exp_status = ExpenseInvoice.status if 'status' in cols_exp else literal('unpaid')
     expenses_q = db.session.query(
         ExpenseInvoice.id,
         literal('expense'),
         literal('Expense').label('party'),
-        ExpenseInvoice.total_after_tax_discount,
+        exp_total,
         literal(0),
-        ExpenseInvoice.date,
-        ExpenseInvoice.status
+        exp_date,
+        exp_status
     )
-    salaries_q = db.session.query(
-        Salary.id,
-        literal('salary'),
-        Employee.full_name,
-        Salary.total_salary,
-        literal(0),
-        func.date(func.printf('%04d-%02d-01', Salary.year, Salary.month)),
-        Salary.status
-    ).join(Employee)
+    _union_parts = [sales_q, purchases_q, expenses_q]
+    if 'salaries' in _tables and 'employees' in _tables:
+        salaries_q = db.session.query(
+            Salary.id,
+            literal('salary'),
+            Employee.full_name,
+            Salary.total_salary,
+            literal(0),
+            date_expr,
+            Salary.status
+        ).join(Employee)
+        _union_parts.append(salaries_q)
 
-    from sqlalchemy import union_all
-    union_q = union_all(sales_q, purchases_q, expenses_q, salaries_q).alias('u')
+    union_q = union_all(*_union_parts).alias('u')
     rows = db.session.query(union_q).all()
 
     # Compute paid from Payments table per invoice
-    from sqlalchemy import func
     invoices = []
+    _payments_exists = 'payments' in _tables
     for r in rows:
-        paid_sum = db.session.query(func.coalesce(func.sum(Payment.amount_paid), 0)).filter(
-            Payment.invoice_id == r.id,
-            Payment.invoice_type == r.type
-        ).scalar() or 0
+        if _payments_exists:
+            try:
+                paid_sum = db.session.query(func.coalesce(func.sum(Payment.amount_paid), 0)).filter(
+                    Payment.invoice_id == r.id,
+                    Payment.invoice_type == r.type
+                ).scalar() or 0
+            except Exception:
+                paid_sum = 0
+        else:
+            paid_sum = 0
         total_val = float(r.total) if r.total is not None else 0.0
         paid_val = float(paid_sum)
         # Compute status dynamically to always reflect latest payments
@@ -948,12 +1382,28 @@ def reports():
         start_dt = today.replace(day=1)
         end_dt = today
 
-    # Sales totals by branch
-    sales_place = db.session.query(func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0)) \
-        .filter(SalesInvoice.date.between(start_dt, end_dt), SalesInvoice.branch == 'place_india').scalar() or 0
-    sales_china = db.session.query(func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0)) \
-        .filter(SalesInvoice.date.between(start_dt, end_dt), SalesInvoice.branch == 'china_town').scalar() or 0
-    total_sales = float(sales_place) + float(sales_china)
+
+    # Optional branch filter
+    branch_filter = request.args.get('branch')
+    if branch_filter and branch_filter != 'all':
+        sales_place = db.session.query(func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0)) \
+            .filter(SalesInvoice.date.between(start_dt, end_dt), SalesInvoice.branch == branch_filter).scalar() or 0
+        sales_china = 0
+        total_sales = float(sales_place)
+        daily_rows = db.session.query(SalesInvoice.date.label('d'), func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0).label('t')) \
+            .filter(SalesInvoice.date.between(start_dt, end_dt), SalesInvoice.branch == branch_filter) \
+            .group_by(SalesInvoice.date) \
+            .order_by(SalesInvoice.date.asc()).all()
+        line_labels = [r.d.strftime('%Y-%m-%d') for r in daily_rows]
+        line_values = [float(r.t or 0) for r in daily_rows]
+
+    # Sales totals by branch (default when no specific branch selected)
+    if not branch_filter or branch_filter == 'all':
+        sales_place = db.session.query(func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0)) \
+            .filter(SalesInvoice.date.between(start_dt, end_dt), SalesInvoice.branch == 'place_india').scalar() or 0
+        sales_china = db.session.query(func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0)) \
+            .filter(SalesInvoice.date.between(start_dt, end_dt), SalesInvoice.branch == 'china_town').scalar() or 0
+        total_sales = float(sales_place) + float(sales_china)
 
     # Purchases and Expenses
     total_purchases = float(db.session.query(func.coalesce(func.sum(PurchaseInvoice.total_after_tax_discount), 0))
@@ -975,12 +1425,13 @@ def reports():
     profit = float(total_sales) - (float(total_purchases) + float(total_expenses) + float(total_salaries))
 
     # Line chart: daily sales
-    daily_rows = db.session.query(SalesInvoice.date.label('d'), func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0).label('t')) \
-        .filter(SalesInvoice.date.between(start_dt, end_dt)) \
-        .group_by(SalesInvoice.date) \
-        .order_by(SalesInvoice.date.asc()).all()
-    line_labels = [r.d.strftime('%Y-%m-%d') for r in daily_rows]
-    line_values = [float(r.t or 0) for r in daily_rows]
+    if not branch_filter or branch_filter == 'all':
+        daily_rows = db.session.query(SalesInvoice.date.label('d'), func.coalesce(func.sum(SalesInvoice.total_after_tax_discount), 0).label('t')) \
+            .filter(SalesInvoice.date.between(start_dt, end_dt)) \
+            .group_by(SalesInvoice.date) \
+            .order_by(SalesInvoice.date.asc()).all()
+        line_labels = [r.d.strftime('%Y-%m-%d') for r in daily_rows]
+        line_values = [float(r.t or 0) for r in daily_rows]
 
     # Payment method distribution across invoices
     def pm_counts(model, date_col, method_col):
@@ -1061,7 +1512,7 @@ def register_payment_ajax():
         return jsonify({'status':'error', 'message':'invalid_amount'}), 400
     if amount <= 0:
         return jsonify({'status':'error', 'message':'invalid_amount'}), 400
-    method = request.form.get('payment_method')
+    method = (request.form.get('payment_method') or 'CASH').strip().upper()
 
     # Register payment
     pay = Payment(invoice_id=invoice_id, invoice_type=invoice_type, amount_paid=amount, payment_method=method)
@@ -1129,7 +1580,7 @@ def register_payment_ajax():
 
     # Emit socket event (if desired)
     try:
-        socketio.emit('payment_update', {'invoice_id': invoice_id, 'invoice_type': invoice_type, 'amount': amount}, broadcast=True)
+        socketio.emit('payment_update', {'invoice_id': invoice_id, 'invoice_type': invoice_type, 'amount': amount})
     except Exception:
         pass
 
@@ -1304,6 +1755,50 @@ def salaries_statements_print():
         company_name = (s.company_name or '').strip() if s and s.company_name else 'Company'
     except Exception:
         company_name = 'Company'
+
+    # HTML print (professional header) unless mode=pdf explicitly
+    if request.args.get('mode') != 'pdf':
+        # Prepare rows and totals for template
+        rows = []
+        totals = {
+            'basic': 0.0, 'allow': 0.0, 'ded': 0.0, 'prev': 0.0, 'total': 0.0, 'paid': 0.0, 'remaining': 0.0
+        }
+        for s_row in recs:
+            paid = paid_map.get(s_row.id, 0.0)
+            total = float(s_row.total_salary or 0)
+            remaining = max(total - paid, 0.0)
+            rows.append({
+                'employee_name': s_row.employee.full_name if s_row.employee else str(s_row.employee_id),
+                'basic': float(s_row.basic_salary or 0),
+                'allow': float(s_row.allowances or 0),
+                'ded': float(s_row.deductions or 0),
+                'prev': float(s_row.previous_salary_due or 0),
+                'total': total,
+                'paid': paid,
+                'remaining': remaining,
+                'status': s_row.status,
+            })
+            totals['basic'] += float(s_row.basic_salary or 0)
+            totals['allow'] += float(s_row.allowances or 0)
+            totals['ded'] += float(s_row.deductions or 0)
+            totals['prev'] += float(s_row.previous_salary_due or 0)
+            totals['total'] += total
+            totals['paid'] += paid
+            totals['remaining'] += remaining
+        # Header data
+        try:
+            from models import Settings
+            s = Settings.query.first()
+            company_name = (s.company_name or '').strip() if s and s.company_name else 'Company'
+        except Exception:
+            company_name = 'Company'
+        logo_url = url_for('static', filename='logo.svg', _external=False)
+        title = _("Payroll Statements / كشوفات الرواتب")
+        meta = _("Month / الشهر") + f": {year}-{month:02d}"
+        header_note = _("Generated by System / تم التوليد بواسطة النظام")
+        return render_template('print/payroll.html',
+            title=title, company_name=company_name, logo_url=logo_url, header_note=header_note,
+            meta=meta, rows=rows, totals=totals)
 
     # Try PDF via reportlab
     try:
@@ -1529,9 +2024,27 @@ def salaries_monthly_save():
     if updated:
         db.session.commit()
         flash(_('تم حفظ التعديلات / Changes saved'), 'success')
-    else:
-        flash(_('لا تعديلات / No changes'), 'info')
-    return redirect(url_for('salaries_monthly', year=request.form.get('year'), month=request.form.get('month')))
+
+@app.route('/settings/print', methods=['POST'])
+@login_required
+def settings_print_save():
+    from models import Settings
+    s = Settings.query.first()
+    if not s:
+        s = Settings()
+        db.session.add(s)
+    s.receipt_paper_width = (request.form.get('receipt_paper_width') or '80')
+    s.receipt_margin_top_mm = int(request.form.get('receipt_margin_top_mm') or 5)
+    s.receipt_margin_bottom_mm = int(request.form.get('receipt_margin_bottom_mm') or 5)
+    s.receipt_margin_left_mm = int(request.form.get('receipt_margin_left_mm') or 3)
+    s.receipt_margin_right_mm = int(request.form.get('receipt_margin_right_mm') or 3)
+    s.receipt_font_size = int(request.form.get('receipt_font_size') or 12)
+    s.receipt_show_logo = bool(request.form.get('receipt_show_logo'))
+    s.receipt_show_tax_number = bool(request.form.get('receipt_show_tax_number'))
+    s.receipt_footer_text = (request.form.get('receipt_footer_text') or '').strip()
+    db.session.commit()
+    flash(_('Print settings saved / تم حفظ إعدادات الطباعة'), 'success')
+    return redirect(url_for('settings'))
 
 
 # Legacy /vat route redirects to the new VAT dashboard
@@ -1569,20 +2082,73 @@ def settings():
         s.place_india_label = request.form.get('place_india_label') or 'Place India'
         s.china_town_label = request.form.get('china_town_label') or 'China Town'
         s.default_theme = (request.form.get('default_theme') or 'light').lower()
+        # Receipt settings
+        s.receipt_paper_width = (request.form.get('receipt_paper_width') or s.receipt_paper_width or '80')
+        try:
+            s.receipt_font_size = int(request.form.get('receipt_font_size') or s.receipt_font_size or 12)
+        except Exception:
+            pass
+        s.logo_url = (request.form.get('logo_url') or s.logo_url or '/static/chinese-logo.svg')
+        s.receipt_show_logo = bool(request.form.get('receipt_show_logo'))
+        s.receipt_show_tax_number = bool(request.form.get('receipt_show_tax_number'))
+        s.receipt_footer_text = (request.form.get('receipt_footer_text') or s.receipt_footer_text or '')
         db.session.commit()
         flash(_('Settings saved successfully / تم حفظ الإعدادات'), 'success')
         return redirect(url_for('settings'))
     return render_template('settings.html', s=s or Settings())
 
+@app.route('/change_password', methods=['POST'])
+@login_required
+def change_password():
+    current = (request.form.get('current_password') or '').strip()
+    new = (request.form.get('new_password') or '').strip()
+    confirm = (request.form.get('confirm_password') or '').strip()
+    # Validate
+    if not current or not new or not confirm:
+        flash(_('Please fill all fields / الرجاء تعبئة جميع الحقول'), 'danger')
+        return redirect(url_for('settings'))
+    if new != confirm:
+        flash(_('New passwords do not match / كلمتا المرور غير متطابقتين'), 'danger')
+        return redirect(url_for('settings'))
+    if new == current:
+        flash(_('New password must be different from current / يجب أن تكون كلمة المرور الجديدة مختلفة عن الحالية'), 'danger')
+        return redirect(url_for('settings'))
+    # Verify current against fresh DB state
+    try:
+        u = User.query.get(current_user.id)
+    except Exception:
+        u = None
+    if not u or not bcrypt.check_password_hash(u.password_hash, current):
+        flash(_('Current password is incorrect / كلمة المرور الحالية غير صحيحة'), 'danger')
+        return redirect(url_for('settings'))
+    # Update securely
+    u.set_password(new, bcrypt)
+    try:
+        db.session.commit()
+        # Sync session object
+        try:
+            current_user.password_hash = u.password_hash
+        except Exception:
+            pass
+        flash(_('Password updated successfully / تم تحديث كلمة المرور بنجاح'), 'success')
+    except Exception as e:
+        db.session.rollback()
+        flash(_('Unexpected error. Please try again / حدث خطأ غير متوقع، حاول مرة أخرى'), 'danger')
+    return redirect(url_for('settings'))
+
+
 # ---- Simple permission checker usable in routes (Python scope)
 from models import UserPermission
 
-def can_perm(screen:str, perm:str)->bool:
+def can_perm(screen, perm, branch_scope=None):
     try:
         if getattr(current_user,'role','') == 'admin':
             return True
         q = UserPermission.query.filter_by(user_id=current_user.id, screen_key=screen)
+        # Branch-aware: allow if permission exists for this branch or for 'all'
         for p in q.all():
+            if branch_scope and p.branch_scope not in (branch_scope, 'all', None):
+                continue
             if perm == 'view' and p.can_view: return True
             if perm == 'add' and p.can_add: return True
             if perm == 'edit' and p.can_edit: return True
@@ -1592,8 +2158,80 @@ def can_perm(screen:str, perm:str)->bool:
         pass
     return False
 
+def first_allowed_sales_branch():
+    try:
+        if getattr(current_user,'role','') == 'admin':
+            return 'all'
+        perms = UserPermission.query.filter_by(user_id=current_user.id, screen_key='sales').all()
+        scopes = [p.branch_scope for p in perms if p.can_view]
+        if not scopes:
+            return None
+        if 'all' in scopes or None in scopes:
+            return 'all'
+        # return first specific branch
+        return scopes[0]
+    except Exception:
+        return None
+
+
+BRANCH_CODES = {'china_town': 'China Town', 'place_india': 'Place India'}
+PAYMENT_METHODS = ['CASH','MADA','VISA','MASTERCARD','BANK','AKS','GCC']
+
+def is_valid_branch(code:str)->bool:
+    return code in BRANCH_CODES
+
+def branch_label(code:str)->str:
+    return BRANCH_CODES.get(code, code)
+
+
+# ---- ZATCA TLV QR Helpers ----
+import base64 as _b64
+from datetime import datetime as _dtmod, timezone as _tz
+
+def _tlv(tag: int, value: str) -> bytes:
+    data = value.encode('utf-8')
+    length = len(data)
+    if length > 255:
+        # Basic support: split into chunks of 255 if needed (rare for our fields)
+        length_bytes = bytes([length & 0xFF])
+    else:
+        length_bytes = bytes([length])
+    return bytes([tag]) + length_bytes + data
+
+
+def build_zatca_tlv_b64(seller_name: str, vat_number: str, invoice_dt_iso: str, total_with_vat: float, vat_total: float) -> str:
+    payload = (
+        _tlv(1, seller_name or '') +
+        _tlv(2, vat_number or '') +
+        _tlv(3, invoice_dt_iso or '') +
+        _tlv(4, f"{float(total_with_vat or 0):.2f}") +
+        _tlv(5, f"{float(vat_total or 0):.2f}")
+    )
+    return _b64.b64encode(payload).decode('utf-8')
+
+
+def make_qr_data_url_from_b64(data_b64: str, box_size: int = 3) -> str | None:
+    try:
+        # Lazy import; if qrcode is unavailable, return None gracefully
+        try:
+            import qrcode
+        except Exception:
+            return None
+        from io import BytesIO
+        img = qrcode.make(data_b64)
+        buf = BytesIO()
+        img.save(buf, format='PNG')
+        return 'data:image/png;base64,' + _b64.b64encode(buf.getvalue()).decode('utf-8')
+    except Exception:
+        return None
+
+# Expose constants to templates
+@app.context_processor
+def inject_globals():
+    return dict(PAYMENT_METHODS=PAYMENT_METHODS, BRANCH_CODES=BRANCH_CODES)
+
+
 # ---------------------- Users API ----------------------
-@csrf.exempt
 @app.route('/api/users', methods=['GET'])
 @login_required
 def api_users_list():
@@ -1615,7 +2253,6 @@ def api_users_list():
     ]
     return jsonify({'items':data,'page':pag.page,'pages':pag.pages,'total':pag.total})
 
-@csrf.exempt
 @app.route('/api/users', methods=['POST'])
 @login_required
 def api_users_create():
@@ -1636,7 +2273,6 @@ def api_users_create():
     db.session.commit()
     return jsonify({'status':'ok','id':u.id})
 
-@csrf.exempt
 @app.route('/api/users/<int:uid>', methods=['PATCH'])
 @login_required
 def api_users_update(uid):
@@ -1652,7 +2288,119 @@ def api_users_update(uid):
     db.session.commit()
     return jsonify({'status':'ok'})
 
-@csrf.exempt
+# ---- Menu admin helpers ----
+@app.context_processor
+def inject_section_image_helper():
+    from flask import url_for as _url_for
+    def section_image_for(name: str):
+        # Placeholder mapping can be customized later based on name
+        return _url_for('static', filename='img/item-placeholder.svg')
+    return dict(section_image_for=section_image_for)
+
+
+# ---- Menu Admin Routes ----
+@app.route('/menu')
+@login_required
+def menu_admin():
+    from models import MenuSection, MenuSectionItem, Meal
+    section_id = request.args.get('section_id', type=int)
+    sections = MenuSection.query.order_by(MenuSection.display_order.asc(), MenuSection.name.asc()).all()
+    current_section = MenuSection.query.get(section_id) if section_id else None
+    meals = Meal.query.filter_by(active=True).order_by(Meal.name.asc()).all()
+    items = []
+    if current_section:
+        items = (MenuSectionItem.query
+                 .filter_by(section_id=current_section.id)
+                 .order_by(MenuSectionItem.display_order.asc())
+                 .all())
+    # counts per section
+    from sqlalchemy import func
+    counts = dict(db.session.query(MenuSectionItem.section_id, func.count(MenuSectionItem.id))
+                  .group_by(MenuSectionItem.section_id).all())
+    item_counts = {s.id: counts.get(s.id, 0) for s in sections}
+    return render_template('menu.html', sections=sections, current_section=current_section,
+                           meals=meals, items=items, item_counts=item_counts)
+
+
+@app.route('/menu/section/add', methods=['POST'])
+@login_required
+def menu_section_add():
+    from models import MenuSection
+    name = (request.form.get('name') or '').strip()
+    branch = (request.form.get('branch') or '').strip() or None
+    display_order = request.form.get('display_order', type=int) or 0
+    image_url = (request.form.get('image_url') or '').strip() or None
+    if not name:
+        flash(_('Name is required'), 'danger')
+        return redirect(url_for('menu_admin'))
+    db.session.add(MenuSection(name=name, branch=branch, display_order=display_order, image_url=image_url))
+    db.session.commit()
+    return redirect(url_for('menu_admin'))
+
+
+@app.route('/menu/section/delete/<int:section_id>')
+@login_required
+def menu_section_delete(section_id):
+    from models import MenuSection, MenuSectionItem
+    sec = MenuSection.query.get_or_404(section_id)
+    # delete items then section
+    MenuSectionItem.query.filter_by(section_id=sec.id).delete(synchronize_session=False)
+    db.session.delete(sec)
+    db.session.commit()
+    return redirect(url_for('menu_admin'))
+
+
+@app.route('/menu/item/add', methods=['POST'])
+@login_required
+def menu_item_add():
+    from models import MenuSectionItem, Meal
+    section_id = request.form.get('section_id', type=int)
+    meal_id = request.form.get('meal_id', type=int)
+    display_order = request.form.get('display_order', type=int) or 0
+    price_override = request.form.get('price_override')
+    image_url = (request.form.get('item_image_url') or '').strip() or None
+    po = None
+    try:
+        po = float(price_override) if price_override not in (None, '',) else None
+    except Exception:
+        po = None
+    if not section_id or not meal_id:
+        flash(_('Missing data'), 'danger')
+        return redirect(url_for('menu_admin'))
+    db.session.add(MenuSectionItem(section_id=section_id, meal_id=meal_id,
+                                   display_order=display_order, price_override=po,
+                                   image_url=image_url))
+    db.session.commit()
+    return redirect(url_for('menu_admin', section_id=section_id))
+
+
+@app.route('/menu/item/<int:item_id>/update', methods=['POST'])
+@login_required
+def menu_item_update(item_id):
+    from models import MenuSectionItem
+    it = MenuSectionItem.query.get_or_404(item_id)
+    po = request.form.get('price_override')
+    try:
+        it.price_override = float(po) if po not in (None, '',) else None
+    except Exception:
+        it.price_override = None
+    it.display_order = request.form.get('display_order', type=int) or 0
+    img = (request.form.get('item_image_url') or '').strip()
+    it.image_url = img or None
+    db.session.commit()
+    return redirect(url_for('menu_admin', section_id=it.section_id))
+
+
+@app.route('/menu/item/<int:item_id>/delete', methods=['POST'])
+@login_required
+def menu_item_delete(item_id):
+    from models import MenuSectionItem
+    it = MenuSectionItem.query.get_or_404(item_id)
+    sid = it.section_id
+    db.session.delete(it)
+    db.session.commit()
+    return redirect(url_for('menu_admin', section_id=sid))
+
 @app.route('/api/users', methods=['DELETE'])
 @login_required
 def api_users_delete():
@@ -1703,12 +2451,14 @@ def require_perm(screen_key:str, perm:str):
 
 @app.context_processor
 def inject_can():
-    return dict(can=lambda screen,perm: (getattr(current_user,'role','')=='admin') or user_has_perm(current_user, screen, perm))
+    return dict(
+        can=lambda screen,perm: (getattr(current_user,'role','')=='admin') or user_has_perm(current_user, screen, perm),
+        can_branch=lambda screen,perm,branch_scope: can_perm(screen, perm, branch_scope)
+    )
 
 # ---------------------- Permissions API ----------------------
 from models import UserPermission
 
-@csrf.exempt
 @app.route('/api/users/<int:uid>/permissions', methods=['GET'])
 @login_required
 def api_user_permissions_get(uid):
@@ -1733,7 +2483,6 @@ def api_user_permissions_get(uid):
     ]
     return jsonify({'items': out})
 
-@csrf.exempt
 @app.route('/api/users/<int:uid>/permissions', methods=['POST'])
 @login_required
 def api_user_permissions_save(uid):
@@ -1759,8 +2508,78 @@ def api_user_permissions_save(uid):
     return jsonify({'status':'ok','count':len(items)})
 
 
-@app.route('/users')
+# Retention: 12 months with PDF export
+@app.route('/invoices/retention', methods=['GET'], endpoint='invoices_retention')
 @login_required
+def invoices_retention_view():
+    # Show invoices older than 12 months (approx 365 days)
+    cutoff = datetime.utcnow().date() - timedelta(days=365)
+    sales_old = SalesInvoice.query.filter(SalesInvoice.date < cutoff).order_by(SalesInvoice.date.desc()).limit(200).all()
+    purchases_old = PurchaseInvoice.query.filter(PurchaseInvoice.date < cutoff).order_by(PurchaseInvoice.date.desc()).limit(200).all()
+    expenses_old = ExpenseInvoice.query.filter(ExpenseInvoice.date < cutoff).order_by(ExpenseInvoice.date.desc()).limit(200).all()
+    return render_template('retention.html', cutoff=cutoff, sales=sales_old, purchases=purchases_old, expenses=expenses_old)
+
+@app.route('/invoices/retention/export', endpoint='invoices_retention_export')
+@login_required
+def invoices_retention_export_view():
+    # Export invoices older than 12 months to a single PDF (summary style)
+    from flask import send_file
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+    import io
+    cutoff = datetime.utcnow().date() - timedelta(days=365)
+    kind = (request.args.get('type') or 'all').lower()
+    # Collect
+    sales = SalesInvoice.query.filter(SalesInvoice.date < cutoff).order_by(SalesInvoice.date.asc()).all() if kind in ['all','sales'] else []
+    purchases = PurchaseInvoice.query.filter(PurchaseInvoice.date < cutoff).order_by(PurchaseInvoice.date.asc()).all() if kind in ['all','purchase','purchases'] else []
+    expenses = ExpenseInvoice.query.filter(ExpenseInvoice.date < cutoff).order_by(ExpenseInvoice.date.asc()).all() if kind in ['all','expense','expenses'] else []
+
+    buf = io.BytesIO()
+    p = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    # Optional Arabic font shaper reused
+    def shape_ar(t):
+        try:
+            import arabic_reshaper
+            from bidi.algorithm import get_display
+            return get_display(arabic_reshaper.reshape(str(t)))
+        except Exception:
+            return str(t)
+
+    y = h - 40
+    p.setTitle(f"Invoices older than {cutoff}")
+    p.setFont("Helvetica-Bold", 14)
+    p.drawString(40, y, f"Invoices older than {cutoff}")
+    y -= 30
+
+    def line(txt, size=10):
+        nonlocal y
+        if y < 40:
+            p.showPage(); y = h - 40; p.setFont("Helvetica", size)
+        p.setFont("Helvetica", size)
+        p.drawString(40, y, txt)
+        y -= 16
+
+    total_count = 0
+    for inv in sales:
+        total_count += 1
+        line(f"[SALES] {inv.invoice_number} | {inv.date} | {inv.branch} | PM: {inv.payment_method} | Total: {float(inv.total_after_tax_discount or 0):.2f}")
+    for inv in purchases:
+        total_count += 1
+        name = getattr(inv, 'supplier_name', '-')
+        line(f"[PURCHASE] {inv.invoice_number} | {inv.date} | {shape_ar(name)} | PM: {inv.payment_method} | Total: {float(inv.total_after_tax_discount or 0):.2f}")
+    for inv in expenses:
+        total_count += 1
+        line(f"[EXPENSE] {inv.invoice_number} | {inv.date} | PM: {inv.payment_method} | Total: {float(inv.total_after_tax_discount or 0):.2f}")
+
+    if total_count == 0:
+        line("No invoices older than 12 months / لا توجد فواتير أقدم من 12 شهراً", size=12)
+
+    p.showPage(); p.save(); buf.seek(0)
+    return send_file(buf, as_attachment=True, download_name=f"invoices_retention_{cutoff}.pdf", mimetype='application/pdf')
+
+@app.route('/users')
 @require_perm('users','view')
 def users():
     us = User.query.order_by(User.username.asc()).all()
@@ -1830,11 +2649,32 @@ def print_invoices(section):
         p.drawString(50, y, shape_ar(f"Invoices - {section.title()}"))
     else:
         p.setFont("Helvetica-Bold", 14)
-        p.drawString(50, y, company_name or "Company")
-        y -= 20
-        p.setFont("Helvetica", 12)
-        p.drawString(50, y, f"Invoices - {section.title()}")
-    y -= 30
+
+@app.route('/sales/<int:invoice_id>/print', methods=['GET'])
+@login_required
+def print_sales_receipt(invoice_id:int):
+    # Receipt-style (80mm) print for a single sales invoice
+    inv = SalesInvoice.query.get_or_404(invoice_id)
+    items = SalesInvoiceItem.query.filter_by(invoice_id=invoice_id).all()
+    try:
+        from models import Settings
+        s = Settings.query.first()
+        company_name = (s.company_name or '').strip() if s and s.company_name else 'Company'
+        tax_number = (s.tax_number or '').strip() if s and s.tax_number else None
+        phone = (s.phone or '').strip() if s and s.phone else None
+        currency = s.currency if s and s.currency else 'SAR'
+    except Exception:
+        company_name, tax_number, phone, currency = 'Company', None, None, 'SAR'
+    logo_url = url_for('static', filename='logo.svg', _external=False)
+    return render_template('print/receipt.html',
+        company_name=company_name,
+        tax_number=tax_number,
+        phone=phone,
+        currency=currency,
+        logo_url=logo_url,
+        inv=inv,
+        items=items,
+    )
 
     # Body rows
     if ar_font:
@@ -1878,7 +2718,7 @@ def single_payment(invoice_id):
             'invoice_id': invoice_id,
             'new_status': invoice.status,
             'paid_amount': invoice.paid_amount
-        }, broadcast=True)
+        })
 
         flash(_('Payment recorded successfully / تم تسجيل الدفعة بنجاح'), 'success')
 
@@ -1906,7 +2746,7 @@ def bulk_payment():
         socketio.emit('invoice_update', {
             'bulk_update': True,
             'updated_invoices': invoice_ids
-        }, broadcast=True)
+        })
 
         flash(_('Bulk payment recorded successfully / تم تسجيل الدفعة الجماعية بنجاح'), 'success')
 
@@ -1999,7 +2839,7 @@ def meals():
             'meal_name': meal.display_name,
             'total_cost': float(meal.total_cost),
             'selling_price': float(meal.selling_price)
-        }, broadcast=True)
+        })
 
         flash(_('Meal created successfully / تم إنشاء الوجبة بنجاح'), 'success')
         return redirect(url_for('meals'))

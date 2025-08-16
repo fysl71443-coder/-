@@ -59,6 +59,7 @@ class SalesInvoice(db.Model):
     payment_method = db.Column(db.String(20), nullable=False)
     branch = db.Column(db.String(50), nullable=False)  # فرع الفاتورة (Place India أو China Town)
     customer_name = db.Column(db.String(100), nullable=True)
+    customer_phone = db.Column(db.String(30), nullable=True)
     total_before_tax = db.Column(db.Numeric(12, 2), nullable=False)
     tax_amount = db.Column(db.Numeric(12, 2), nullable=False)
     discount_amount = db.Column(db.Numeric(12, 2), nullable=False, default=0)
@@ -328,9 +329,85 @@ class Settings(db.Model):
     china_town_label = db.Column(db.String(100), default='China Town')
     currency = db.Column(db.String(10), default='SAR')
     default_theme = db.Column(db.String(10), default='light')  # 'light' or 'dark'
+    # Receipt print settings (sales invoices only)
+    receipt_paper_width = db.Column(db.String(4), default='80')  # '80' or '58'
+    receipt_margin_top_mm = db.Column(db.Integer, default=5)
+    receipt_margin_bottom_mm = db.Column(db.Integer, default=5)
+    receipt_margin_left_mm = db.Column(db.Integer, default=3)
+    receipt_margin_right_mm = db.Column(db.Integer, default=3)
+    receipt_font_size = db.Column(db.Integer, default=12)
+    receipt_show_logo = db.Column(db.Boolean, default=True)
+    receipt_show_tax_number = db.Column(db.Boolean, default=True)
+    receipt_footer_text = db.Column(db.String(300), default='')
+
+    logo_url = db.Column(db.String(300), default='/static/chinese-logo.svg')  # receipt logo
 
     def __repr__(self):
         return f'<Settings {self.company_name or "Settings"}>'
+
+
+class Customer(db.Model):
+    __tablename__ = 'customers'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), nullable=False)
+    phone = db.Column(db.String(50), nullable=True)
+    discount_percent = db.Column(db.Numeric(5, 2), default=0)
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Customer {self.name}>'
+
+class MenuCategory(db.Model):
+    __tablename__ = 'menu_categories'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(200), unique=True, nullable=False)
+    active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<MenuCategory {self.name}>'
+
+
+# POS Menu: Sections and Items
+class MenuSection(db.Model):
+    __tablename__ = 'menu_sections'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    branch = db.Column(db.String(50), nullable=True)  # None => all branches
+    display_order = db.Column(db.Integer, nullable=False, default=0)
+    image_url = db.Column(db.String(300), nullable=True)
+
+    # Relationships
+    items = db.relationship('MenuSectionItem', backref='section', lazy=True, cascade='all, delete-orphan')
+
+    def __repr__(self):
+        return f'<MenuSection {self.name}>'
+
+
+class MenuSectionItem(db.Model):
+    __tablename__ = 'menu_section_items'
+    id = db.Column(db.Integer, primary_key=True)
+    section_id = db.Column(db.Integer, db.ForeignKey('menu_sections.id'), nullable=False)
+    meal_id = db.Column(db.Integer, db.ForeignKey('meals.id'), nullable=False)
+    display_order = db.Column(db.Integer, nullable=False, default=0)
+    price_override = db.Column(db.Numeric(12, 2), nullable=True)
+    image_url = db.Column(db.String(300), nullable=True)
+
+    # Relationships
+    meal = db.relationship('Meal')
+
+    def effective_price(self) -> float:
+        try:
+            if self.price_override is not None:
+                return float(self.price_override)
+            return float(self.meal.selling_price or 0)
+        except Exception:
+            return 0.0
+
+    def __repr__(self):
+        return f'<MenuSectionItem sec={self.section_id} meal={self.meal_id}>'
+
 
 
 class UserPermission(db.Model):
